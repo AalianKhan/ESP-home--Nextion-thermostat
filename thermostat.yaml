@@ -1,0 +1,522 @@
+esphome:
+  name: thermostat
+  platform: ESP8266
+  board: d1_mini
+  on_boot:
+    priority: -10
+    then:
+      - script.execute: checker
+
+wifi:
+  ssid: '5920 Talisman'
+  password: 'Asifmk1972'
+
+# Enable logging
+logger:
+
+ota:
+ 
+# Defining variables
+globals:
+  - id: target_temp
+    type: int
+    initial_value: "22"
+  - id: mode
+    type: int
+    initial_value: "0"
+    # 0 = off
+    # 1 = heat
+    # 2 = ac
+  - id: fan_mode
+    type: int
+    initial_value: "1"
+    # 1 = auto
+    # 0 = always on
+  - id: away_mode
+    type: int
+    initial_value: "0"
+    # 1 = on
+    # 0 = off
+  - id: away_temp
+    type: int
+    restore_value: yes
+### Defining variables for uptime heater
+  - id: heater_last_turn_on
+    type: int
+
+# Defining MQTT
+mqtt:
+  broker: 192.168.86.27
+  username: homeassistant
+  password: Asifmk1972
+  birth_message:
+    topic: stat/thermostat/availability
+    payload: online
+  will_message:
+    topic: stat/thermostat/availability
+    payload: offline
+
+### Defining all relays
+switch:
+# Heater
+  - platform: gpio
+    id: heater
+    pin: D2
+    on_turn_on:
+      - lambda: 'id(heater_last_turn_on) = id(time).now().time;'
+# A/C
+  - platform: gpio
+    id: ac
+    pin: D1
+# Fan
+  - platform: gpio
+    id: fan
+    pin: D8
+
+### Defining Time
+time:
+  - platform: sntp
+    timezone: American/Toronto
+    id: time
+
+### Defining Dallas temperature sensor and Pulishing the value
+dallas:
+  - pin: D5
+sensor:
+  - platform: dallas
+    address: 0xDF03099779475228
+    name: "Thermostat Temperature"
+    resolution: 12
+    id: current_temp
+    state_topic: stat/thermostat/dallas
+    filters:
+      - calibrate_linear:
+          # Map 0.0 (from sensor) to 0.0 (true value)
+        - 29.9 -> 23.1
+        - 31.4 -> 24.6
+        - 32.1 -> 25.4
+        - 32.2 -> 25.5
+        - 31.2 -> 25.2
+        - 18.4 -> 12.3
+        - 35.1 -> 26.2
+        - 29.2 -> 22.4
+        - 28.8 -> 21.8
+        - 28.1 -> 21.1
+        - 27.6 -> 20.8
+        - 27.7 -> 20.8
+        - 29.1 -> 22.1
+    on_value:
+      then:
+        - script.execute: checker
+
+### Defining target temperature sensor for MQTT purposes
+  - platform: template
+    name: Target Temperature
+    id: target_temp_state_sensor
+    lambda: |-
+      return id(target_temp);
+    update_interval: 60s
+    state_topic: stat/thermostat/target
+    on_value:
+      then:
+        - component.update: cold_tolerence
+        - component.update: heat_tolerence
+  - platform: mqtt_subscribe
+    id: target_temp_command_sensor
+    topic: cmnd/thermostat/target
+    on_value:
+      then:
+        - lambda: 'id(display).send_command_no_ack("sleep=0");'
+        - delay: 0.5s
+        - lambda: |-
+            id(target_temp) = x;
+        - component.update: display
+        - component.update: target_temp_state_sensor
+        - logger.log:
+            format: "The target temperature has been set to %d"
+            args: [ 'id(target_temp)' ]
+
+### Defining Target offsets
+  - platform: template
+    id: cold_tolerence
+    lambda: |-
+      return id(target_temp_state_sensor).state -= 0.3;
+  - platform: template
+    id: heat_tolerence
+    lambda: |-
+      return id(target_temp_state_sensor).state += 0.3;
+
+### Defining stat mode sensor for MQTT purposes
+  - platform: template
+    name: Mode
+    id: mode_state_sensor
+    lambda: |-
+      return id(mode);
+    update_interval: 60s
+    state_topic: stat/thermostat/mode
+
+### Defining stat fan mode sensor for MQTT purposes
+  - platform: template
+    name: Fan Mode
+    id: fan_mode_state_sensor
+    lambda: |-
+      return id(fan_mode);
+    update_interval: 60s
+    state_topic: stat/thermostat/fmode
+
+### Recording the uptime of heater
+  - platform: template
+    name: Heater Uptime
+    id: heat_uptime
+    update_interval: 1s
+    lambda: |-
+      if (id(heater).state){
+        return id(time).now().time - id(heater_last_turn_on);
+      } else {
+        return id(heat_uptime).state;
+      }
+
+### Defining command mode sensor for MQTT purposes
+text_sensor:
+  - platform: mqtt_subscribe
+    id: mode_command_sensor
+    topic: cmnd/thermostat/mode
+    on_value:
+      then:
+        - lambda: 'id(display).send_command_no_ack("sleep=0");'
+        - delay: 0.25s
+        - lambda: 'id(display).goto_page("1");'
+        - if:
+            condition:
+              lambda: 'return id(mode_command_sensor).state == "off";'
+            then:
+              lambda: 'id(mode) = 0;'
+            else:
+              - if:
+                  condition:
+                    lambda: 'return id(mode_command_sensor).state == "heat";'
+                  then:
+                    lambda: 'id(mode) = 1;'
+                  else:
+                    - if:
+                        condition:
+                          lambda: 'return id(mode_command_sensor).state == "cool";'
+                        then:
+                          lambda: 'id(mode) = 2;'
+        - component.update: mode_state_sensor
+        - logger.log:
+            format: "The mode has been set to %d"
+            args: [ 'id(mode)' ]
+        - script.execute: checker
+        - delay: 0.25s
+        - if:
+            condition:
+              lambda: 'return id(mode) == 0;'
+            then:
+              - lambda: |-
+                  id(display).send_command_no_ack("main.bg.pic=0");
+                  id(display).send_command_no_ack("main.target.picc=0");
+                  id(display).send_command_no_ack("main.current.picc=0");
+            else:
+              - if:
+                  condition:
+                    lambda: 'return id(mode) == 1;'
+                  then:
+                    - lambda: |-
+                        id(display).send_command_no_ack("main.bg.pic=1");
+                        id(display).send_command_no_ack("main.target.picc=1");
+                        id(display).send_command_no_ack("main.current.picc=1");
+                  else:
+                    - if:
+                        condition:
+                          lambda: 'return id(mode) == 2;'
+                        then:
+                          - lambda: |-
+                              id(display).send_command_no_ack("main.bg.pic=2");
+                              id(display).send_command_no_ack("main.target.picc=2");
+                              id(display).send_command_no_ack("main.current.picc=2");
+
+### Defining command fan mode sensor for MQTT purposes
+  - platform: mqtt_subscribe
+    id: fan_mode_command_sensor
+    topic: cmnd/thermostat/fmode
+    on_value:
+      then:
+        - lambda: 'id(display).send_command_no_ack("sleep=0");'
+        - delay: 0.5s
+        - if:
+            condition:
+              lambda: 'return id(fan_mode_command_sensor).state == "auto";'
+            then:
+              lambda: 'id(fan_mode) = 1;'
+            else:
+              - if:
+                  condition:
+                    lambda: 'return id(fan_mode_command_sensor).state == "on";'
+                  then:
+                    lambda: 'id(fan_mode) = 0;'
+        - component.update: display
+        - component.update: fan_mode_state_sensor
+        - logger.log:
+            format: "The fan mode has been set to %d"
+            args: [ 'id(fan_mode)' ]
+        - script.execute: checker
+
+### Defining what to do on all types of modes including fan modes
+script:
+  id: checker
+  then:
+    # turn on the fan if the fan mode is set to always on
+    - if:
+        condition:
+          lambda: 'return id(fan_mode) == 0;'
+        then:
+          - switch.turn_on: fan
+    # If mode is set to heat, then...
+    - if:
+        condition:
+          lambda: 'return id(mode) == 1;'
+        then:
+          # turn on the heater and fan if its cold
+          - if:
+              condition:
+                lambda: 'return id(current_temp).state < id(cold_tolerence).state;'
+              then:
+                - switch.turn_on: heater
+                - switch.turn_on: fan
+          # turn off the heater if its hot
+              else:
+                - if:
+                    condition:
+                      lambda: 'return id(current_temp).state > id(heat_tolerence).state;'
+                    then:
+                      - switch.turn_off: heater
+                      # if fan mode is set to auto then turn off the fan
+                      - if:
+                          condition:
+                            lambda: 'return id(fan_mode) == 1;'
+                          then:
+                            switch.turn_off: fan
+        else:
+          # if mode is set to cool, then...
+          - if:
+              condition:
+                lambda: 'return id(mode) == 2;'
+              then:
+                # turn on the ac and fan if its hot
+                - if:
+                    condition:
+                      lambda: 'return id(current_temp).state > id(heat_tolerence).state;'
+                    then:
+                      - switch.turn_on: ac
+                      - switch.turn_on: fan
+                    else:
+                      # turn off the ac if its cold
+                      - if:
+                          condition:
+                            lambda: 'return id(current_temp).state < id(cold_tolerence).state;'
+                          then:
+                            - switch.turn_off: ac
+                            # if the fan mode is set to auto then turn off the fan
+                            - if:
+                                condition:
+                                  lambda: 'return id(fan_mode) == 1;'
+                                then:
+                                  - switch.turn_off: fan
+              else:
+                # if the mode is set to off, then turn off the ac and heater
+                - if:
+                    condition:
+                      lambda: 'return id(mode) == 0;'
+                    then:
+                      - switch.turn_off: heater
+                      - switch.turn_off: ac
+                      # if fan mode is set to auto then turn off the fan
+                      - if:
+                          condition:
+                            lambda: 'return id(fan_mode) == 1;'
+                          then:
+                            - switch.turn_off: fan
+
+### Defining Nextion Display and Defining What To Display
+uart:
+  rx_pin: D3
+  tx_pin: D4
+  baud_rate: 9600
+
+
+display:
+  - platform: nextion
+    id: display
+    lambda: |-
+      it.set_component_text_printf("main.target", "%d", id(target_temp));
+      it.set_component_text_printf("main.current", "%.1f", id(current_temp).state);
+
+### Defining Touch components and What will they do
+binary_sensor:
+  - platform: nextion
+    page_id: 1
+    component_id: 4
+    name: "Increase Target Temperature"
+    on_press:
+      then:
+        - lambda: |-
+            (id(target_temp) += 1);
+        - component.update: display
+        - component.update: target_temp_state_sensor
+        - logger.log:
+            format: "The target temperature has been increased to %d"
+            args: [ 'id(target_temp)' ]  
+
+  - platform: nextion
+    page_id: 1
+    component_id: 5
+    name: "Decrease Target Temperature"
+    on_press:
+      then:
+        - lambda: |-
+            (id(target_temp) -= 1);
+        - component.update: display
+        - component.update: target_temp_state_sensor
+        - logger.log:
+            format: "The target temperature has been decreased to %d"
+            args: [ 'id(target_temp)' ]
+  - platform: nextion
+    page_id: 2
+    component_id: 5
+    name: "mode"
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return id(mode) == 0;
+            then:
+              - lambda: |-
+                  id(mode) = 1;
+                  id(display).send_command_no_ack("off_heat.en=1");
+              - delay: 0.60s
+              - lambda: |-
+                  id(display).send_command_no_ack("off_heat.en=0");
+                  id(display).send_command_no_ack("main.bg.pic=1");
+                  id(display).send_command_no_ack("main.target.picc=1");
+                  id(display).send_command_no_ack("main.current.picc=1");
+              - component.update: mode_state_sensor
+            else:
+              - if:
+                  condition:
+                      lambda: |-
+                        return id(mode) == 1;
+                  then:
+                    - lambda: |-
+                        id(mode) = 2;
+                        id(display).send_command_no_ack("heat_cool.en=1");
+                    - delay: 0.60s
+                    - lambda: |-
+                        id(display).send_command_no_ack("heat_cool.en=0");
+                        id(display).send_command_no_ack("main.bg.pic=2");
+                        id(display).send_command_no_ack("main.target.picc=2");
+                        id(display).send_command_no_ack("main.current.picc=2");
+                    - component.update: mode_state_sensor
+                  else:
+                    - if:
+                        condition:
+                          lambda: |-
+                            return id(mode) == 2;
+                        then:
+                          - lambda: |-
+                              id(mode) = 0;
+                              id(display).send_command_no_ack("cool_off.en=1");
+                          - delay: 0.60s
+                          - lambda:
+                              id(display).send_command_no_ack("cool_off.en=0");
+                              id(display).send_command_no_ack("main.bg.pic=0");
+                              id(display).send_command_no_ack("main.target.picc=0");
+                              id(display).send_command_no_ack("main.current.picc=0");
+                          - component.update: mode_state_sensor
+        - script.execute: checker
+  - platform: nextion
+    page_id: 1
+    component_id: 6
+    name: "page_2"
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(fan_mode) == 1;'
+            then:
+              lambda: 'id(display).send_command_no_ack("p2.main2.pic=12");'
+            else:
+              - if:
+                  condition:
+                    lambda: 'return id(fan_mode) == 0;'
+                  then:
+                    lambda: 'id(display).send_command_no_ack("p2.main2.pic=13");'
+        - if:
+            condition: 
+              lambda: |-
+                return id(mode) == 0;
+            then:
+              lambda: |-
+                id(display).send_command_no_ack("p2.p1.pic=14");
+        - if:
+            condition: 
+              lambda: |-
+                return id(mode) == 1;
+            then:
+              lambda: |-
+                id(display).send_command_no_ack("p2.p1.pic=24");
+        - if:
+            condition: 
+              lambda: |-
+                return id(mode) == 2;
+            then:
+              lambda: |-
+                id(display).send_command_no_ack("p2.p1.pic=34");
+        - script.execute: checker
+  - platform: nextion
+    page_id: 2
+    component_id: 4
+    name: Fan Mode Button
+    on_press:
+      then:
+        - if:
+            condition: 
+              lambda: 'return id(fan_mode) == 1;'
+            then:
+              - lambda: 'id(fan_mode) = 0;'
+              - lambda: 'id(display).send_command_no_ack("p2.main2.pic=13");'
+            else:
+              - if:
+                  condition:
+                    lambda: 'return id(fan_mode) == 0;'
+                  then:
+                    - lambda: 'id(fan_mode) = 1;'
+                    - lambda: 'id(display).send_command_no_ack("p2.main2.pic=12");'
+        - if:
+            condition: 
+              lambda: |-
+                return id(mode) == 0;
+            then:
+              lambda: |-
+                id(display).send_command_no_ack("p2.p1.pic=14");
+        - if:
+            condition: 
+              lambda: |-
+                return id(mode) == 1;
+            then:
+              lambda: |-
+                id(display).send_command_no_ack("p2.p1.pic=24");
+        - if:
+            condition: 
+              lambda: |-
+                return id(mode) == 2;
+            then:
+              lambda: |-
+                id(display).send_command_no_ack("p2.p1.pic=34");
+        - component.update: display
+        - component.update: fan_mode_state_sensor
+        - logger.log:
+            format: "The fan mode has been set to %d"
+            args: [ 'id(fan_mode)' ]
+        - script.execute: checker
